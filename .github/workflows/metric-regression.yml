@@ -23,5 +23,26 @@ jobs:
       - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3
         with:
           tool: cargo-nextest
+      - name: Prove regressions against the original implementation
+        run: |
+          git fetch --no-tags --depth=1 origin 92ec935122332a75ca53c777a1b16158f3b5c0b2
+          cp crates/simulator/src/state_override_stream.rs /tmp/proposed-state-override-stream.rs
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import subprocess
+          path = Path("crates/simulator/src/state_override_stream.rs")
+          proposed = path.read_text()
+          baseline = subprocess.check_output(["git", "show", "92ec935122332a75ca53c777a1b16158f3b5c0b2:" + str(path)], text=True)
+          marker = "    #[test]\n    fn lane_not_requoted_keeps_its_stale_stamp()"
+          tests = proposed[proposed.index("    fn millisecond_word("):proposed.index(marker)]
+          assert baseline.count(marker) == 1
+          path.write_text(baseline.replace(marker, tests + marker))
+          PYCODE
+          set +e
+          cargo nextest run --locked -p simulator -E 'test(millisecond)'
+          result=$?
+          set -e
+          cp /tmp/proposed-state-override-stream.rs crates/simulator/src/state_override_stream.rs
+          test "$result" -eq 100
       - run: cargo nextest run --locked -p simulator
       - run: cargo clippy --locked -p simulator --all-features --all-targets -- -D warnings

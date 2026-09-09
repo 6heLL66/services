@@ -16,9 +16,8 @@
 //!   unless it equals the timestamp of the block the call runs in; the
 //!   remaining 28 bytes are the maker's price.
 //!
-//! Metric's oracle uses a different layout: its freshness stamp is a uint48
-//! millisecond timestamp at bytes 25..31. This layout is recognized only for
-//! that oracle; its leading bytes are price data, not a registry stamp.
+//! A second layout stores uint48 milliseconds at bytes 25..31. Leading
+//! seconds take precedence when both layouts match the projected stamp.
 //!
 //! Which words are stamps is never guessed from their contents: the block a
 //! frame quotes for is named in the frame, and the timestamp that block will
@@ -41,15 +40,16 @@ use {
     tokio::sync::watch,
 };
 
-/// Number of leading bytes of a registry word holding the venue's freshness
+/// Number of leading bytes of a storage word holding the venue's freshness
 /// stamp. The remaining bytes are the maker's price and must survive
 /// restamping untouched.
 const STAMP_LEN: usize = 4;
-
-const METRIC_ORACLE: Address =
-    alloy_primitives::address!("28d9ccedf1b7ac9b3f090f4f0292837de87c1d39");
 /// Big-endian uint48 milliseconds; the final byte is not part of the stamp.
-const METRIC_STAMP_RANGE: std::ops::Range<usize> = 25..31;
+const MILLIS_STAMP_RANGE: std::ops::Range<usize> = 25..31;
+
+/// Frame timestamps keyed by account, storage slot and whether it is stateDiff.
+/// Keep provenance per word: venues can share an account and overwrite slots.
+type MillisecondStamps = BTreeMap<(Address, B256, bool), u32>;
 
 /// How many recent block gaps are kept to infer the chain's block spacing. A
 /// handful is enough to see past a slot nobody proposed, and few enough that a
@@ -66,9 +66,7 @@ struct Snapshot {
     /// Newest stamp any venue quoted for. Only words carrying it belong to a
     /// lane a maker is quoting for `block_number`.
     stamp: Option<u32>,
-    /// Metric's own frame must recognize the stamp; another venue's stamp
-    /// cannot make a stale or unrecognized Metric quote eligible.
-    metric_stamp: Option<u32>,
+    millisecond_stamps: MillisecondStamps,
     received_at: Option<Instant>,
 }
 
@@ -103,7 +101,7 @@ impl SimulationOverrides {
         let metrics = Metrics::get();
         // Holding this borrow blocks the stream task from publishing, so it is
         // released before the copy is restamped.
-        let (overrides, stamp, metric_stamp) = {
+        let (overrides, stamp, millisecond_stamps) = {
             let snapshot = self.0.snapshots.borrow();
             let Some(received_at) = snapshot.received_at else {
                 metrics.record_override_result(OverrideResult::Empty);
@@ -121,14 +119,10 @@ impl SimulationOverrides {
                 metrics.record_override_result(OverrideResult::Empty);
                 return None;
             }
-            (
-                snapshot.overrides.clone(),
-                snapshot.stamp,
-                snapshot.metric_stamp,
-            )
+            (snapshot.overrides.clone(), snapshot.stamp, snapshot.millisecond_stamps.clone())
         };
         metrics.record_override_result(OverrideResult::Fresh);
-        let overrides = restamp(overrides, stamp, metric_stamp, timestamp);
+        let overrides = restamp(overrides, stamp, &millisecond_stamps, timestamp);
         Some(overrides)
     }
 }
@@ -144,38 +138,37 @@ impl SimulationOverrides {
 fn restamp(
     mut overrides: StateOverride,
     stamp: Option<u32>,
-    metric_stamp: Option<u32>,
+    millisecond_stamps: &MillisecondStamps,
     timestamp: u64,
 ) -> StateOverride {
     let Some(stamp) = stamp else {
         return overrides;
     };
-    // Other venues can keep the snapshot fresh after Metric stops quoting;
-    // moving its stamp forward would revive a quote whose target has passed.
-    let metric_stamp = metric_stamp
-        .filter(|metric_stamp| *metric_stamp == stamp && u64::from(*metric_stamp) >= timestamp)
-        .map(|stamp| (u64::from(stamp) * 1000).to_be_bytes());
-    let metric_timestamp = timestamp
-        .checked_mul(1000)
-        .filter(|millis| *millis < (1u64 << 48))
-        .map(u64::to_be_bytes);
-    let stamp = stamp.to_be_bytes();
-    let timestamp = (timestamp as u32).to_be_bytes();
+    // Never revive a millisecond quote after its target time. This also
+    // bounds the multiplication to a uint32 timestamp, which fits uint48 ms.
+    let millis_timestamp = (timestamp <= u64::from(stamp))
+        .then(|| (timestamp * 1000).to_be_bytes());
+    let stamp_bytes = stamp.to_be_bytes();
+    let timestamp_bytes = (timestamp as u32).to_be_bytes();
     for (address, account) in &mut overrides {
-        let words = [account.state.as_mut(), account.state_diff.as_mut()];
-        for word in words.into_iter().flatten().flat_map(B256Map::values_mut) {
-            if *address == METRIC_ORACLE {
-                if let (Some(stamp), Some(timestamp)) = (metric_stamp, metric_timestamp)
-                    && word[METRIC_STAMP_RANGE] == stamp[2..]
+        for (is_state_diff, words) in [(false, account.state.as_mut()), (true, account.state_diff.as_mut())] {
+            for (slot, word) in words.into_iter().flatten() {
+                if word[..STAMP_LEN] == stamp_bytes {
+                    word[..STAMP_LEN].copy_from_slice(&timestamp_bytes);
+                } else if let Some(timestamp) = millis_timestamp
+                    && millisecond_stamps.get(&(*address, *slot, is_state_diff)) == Some(&stamp)
+                    && matches_millisecond_stamp(word, stamp)
                 {
-                    word[METRIC_STAMP_RANGE].copy_from_slice(&timestamp[2..]);
+                    word[MILLIS_STAMP_RANGE].copy_from_slice(&timestamp[2..]);
                 }
-            } else if word[..STAMP_LEN] == stamp {
-                word[..STAMP_LEN].copy_from_slice(&timestamp);
             }
         }
     }
     overrides
+}
+
+fn matches_millisecond_stamp(word: &B256, stamp: u32) -> bool {
+    word[MILLIS_STAMP_RANGE] == (u64::from(stamp) * 1000).to_be_bytes()[2..]
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,7 +293,7 @@ pub fn spawn_pamm_stream(cfg: &Config, blocks: CurrentBlockWatcher) -> Simulatio
         overrides: StateOverride::default(),
         block_number: 0,
         stamp: None,
-        metric_stamp: None,
+        millisecond_stamps: MillisecondStamps::new(),
         received_at: None,
     });
 
@@ -407,14 +400,8 @@ impl Venues {
         for (venue, update) in frame.venues {
             let overrides = update.state_override;
             let stamp = quoted_at.filter(|stamp| {
-                let metric_stamp = (u64::from(*stamp) * 1000).to_be_bytes();
-                let stamp = stamp.to_be_bytes();
-                words(&overrides).any(|(address, word)| {
-                    if address == METRIC_ORACLE {
-                        word[METRIC_STAMP_RANGE] == metric_stamp[2..]
-                    } else {
-                        word[..STAMP_LEN] == stamp
-                    }
+                words(&overrides).any(|word| {
+                    word[..STAMP_LEN] == stamp.to_be_bytes() || matches_millisecond_stamp(word, *stamp)
                 })
             });
             self.0.insert(venue, Quotes { overrides, stamp });
@@ -424,33 +411,43 @@ impl Venues {
     /// Folds every venue's newest frame into one override set, along with the
     /// newest stamp any of them quoted.
     ///
-    /// Multiple venues keep their lanes in the same shared registry account and
-    /// a frame only ever carries its own, so storage is merged word by
-    /// word: inserting the account wholesale would drop the other venues'
-    /// lanes.
-    fn fold(&self) -> (StateOverride, Option<u32>) {
+    /// Venues can keep their lanes in the same shared registry account and a
+    /// frame only ever carries its own, so storage is merged word by word:
+    /// inserting the account wholesale would drop the other venues' lanes.
+    fn fold(&self) -> (StateOverride, Option<u32>, MillisecondStamps) {
         let mut overrides = StateOverride::default();
         let mut stamp = None;
+        let mut millisecond_stamps = MillisecondStamps::new();
         for quotes in self.0.values() {
             stamp = stamp.max(quotes.stamp);
             for (account, account_override) in &quotes.overrides {
+                for (is_state_diff, words) in [(false, account_override.state.as_ref()), (true, account_override.state_diff.as_ref())] {
+                    for (slot, word) in words.into_iter().flatten() {
+                        let key = (*account, *slot, is_state_diff);
+                        millisecond_stamps.remove(&key);
+                        if let Some(stamp) = quotes.stamp
+                            && matches_millisecond_stamp(word, stamp)
+                        {
+                            millisecond_stamps.insert(key, stamp);
+                        }
+                    }
+                }
                 merge_account(
                     overrides.entry(*account).or_default(),
                     account_override.clone(),
                 );
             }
         }
-        (overrides, stamp)
+        (overrides, stamp, millisecond_stamps)
     }
 }
 
-fn words(overrides: &StateOverride) -> impl Iterator<Item = (Address, &B256)> {
-    overrides.iter().flat_map(|(address, account)| {
+fn words(overrides: &StateOverride) -> impl Iterator<Item = &B256> {
+    overrides.values().flat_map(|account| {
         [account.state.as_ref(), account.state_diff.as_ref()]
             .into_iter()
             .flatten()
             .flat_map(B256Map::values)
-            .map(move |word| (*address, word))
     })
 }
 
@@ -482,13 +479,13 @@ fn merge_words(target: &mut Option<B256Map<B256>>, update: Option<B256Map<B256>>
 }
 
 fn publish(venues: &Venues, block_number: u64, sender: &watch::Sender<Snapshot>) {
-    let (overrides, stamp) = venues.fold();
+    let (overrides, stamp, millisecond_stamps) = venues.fold();
     Metrics::get().venue_count.set(overrides.len() as i64);
     let snapshot = Snapshot {
         overrides,
         block_number,
         stamp,
-        metric_stamp: venues.0.get(&METRIC_ORACLE).and_then(|quotes| quotes.stamp),
+        millisecond_stamps,
         received_at: Some(Instant::now()),
     };
     if let Err(err) = sender.send(snapshot) {
@@ -752,12 +749,12 @@ mod tests {
         for frame in frames {
             venues.update(frame, Some(QUOTED_AT));
         }
-        let (overrides, stamp) = venues.fold();
+        let (overrides, stamp, millisecond_stamps) = venues.fold();
         let (_sender, receiver) = watch::channel(Snapshot {
             overrides,
             block_number,
             stamp,
-            metric_stamp: venues.0.get(&METRIC_ORACLE).and_then(|quotes| quotes.stamp),
+            millisecond_stamps,
             received_at: Some(Instant::now()),
         });
         handle(receiver, max_age)
@@ -773,7 +770,7 @@ mod tests {
             overrides,
             block_number,
             stamp: None,
-            metric_stamp: None,
+            millisecond_stamps: MillisecondStamps::new(),
             received_at: Some(received_at),
         }
     }
@@ -808,7 +805,7 @@ mod tests {
             overrides: StateOverride::default(),
             block_number: 100,
             stamp: None,
-            metric_stamp: None,
+            millisecond_stamps: MillisecondStamps::new(),
             received_at: Some(Instant::now()),
         });
         assert!(
@@ -851,269 +848,101 @@ mod tests {
         assert_eq!(lanes[&lane(2)], word(simulated_at, 0xbb));
     }
 
+    fn millisecond_word(stamp: u32) -> B256 {
+        let mut word = B256::from([0xaa; 32]);
+        word[25..31].copy_from_slice(&(u64::from(stamp) * 1000).to_be_bytes()[2..]);
+        word
+    }
+
     #[test]
-    fn metric_quotes_are_restamped_to_the_simulated_block() {
-        let oracle = address!("28d9ccedf1b7ac9b3f090f4f0292837de87c1d39");
-        let slot: B256 = "0xe3ffa73f3a3b56e693c2ed775464cb3fbe78307b000000000000000000000000"
-            .parse()
-            .unwrap();
-        let head = BlockInfo {
-            number: 25_925_279,
-            timestamp: 1_788_781_703,
-            ..Default::default()
-        };
-
-        // Exercise the full frame -> snapshot -> simulation path, including
-        // stamp detection when Metric is the only venue in the stream.
-        for full_state in [false, true] {
-            let mut frame: Frame = serde_json::from_str(METRIC_FRAME).unwrap();
-            let block_number = frame.block_number.unwrap();
-            if full_state {
-                let account = frame
-                    .venues
-                    .get_mut(&oracle)
-                    .unwrap()
-                    .state_override
-                    .get_mut(&oracle)
-                    .unwrap();
-                account.state = account.state_diff.take();
+    fn millisecond_words_restamp_at_any_address() {
+        // Captured Titan quote for block 25,925,280 and its parent timestamp.
+        let original: B256 = "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2de3800".parse().unwrap();
+        let expected: B256 = "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2af5800".parse().unwrap();
+        for address in [
+            address!("28d9ccedf1b7ac9b3f090f4f0292837de87c1d39"),
+            address!("1111111111111111111111111111111111111111"),
+        ] {
+            for full_state in [false, true] {
+                let mut frame = frame_with(Address::ZERO, address, Some(U256::from(7)), Some(lane(1)));
+                let account = frame.venues.get_mut(&Address::ZERO).unwrap().state_override.get_mut(&address).unwrap();
+                account.state_diff.as_mut().unwrap().insert(lane(1), original);
+                if full_state {
+                    account.state = account.state_diff.take();
+                }
+                let unmodified = frame.venues[&Address::ZERO].state_override.clone();
+                let mut expected_overrides = unmodified.clone();
+                let account = expected_overrides.get_mut(&address).unwrap();
+                account.state.as_mut().or(account.state_diff.as_mut()).unwrap().insert(lane(1), expected);
+                let mut venues = Venues::default();
+                venues.update(frame, Some(1_788_781_715));
+                let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
+                publish(&venues, 25_925_280, &sender);
+                let handle = handle(receiver, Duration::from_secs(30));
+                assert_eq!(handle.overrides_for(25_925_279, 1_788_781_703), Some(expected_overrides));
+                // Copies are restamped; the snapshot must survive, and an old
+                // quote must never be moved forward (including overflow inputs).
+                for timestamp in [1_788_781_715, 1_788_781_727, (1u64 << 48) / 1000 + 1, u64::MAX] {
+                    assert_eq!(handle.overrides_for(25_925_279, timestamp), Some(unmodified.clone()));
+                }
             }
-            let mut venues = Venues::default();
-            venues.update(frame, quoted_at(&head, block_number, 12));
-            let (overrides, stamp) = venues.fold();
-            assert_eq!(stamp, Some(1_788_781_715));
-            // An unrepresentable uint48 millisecond timestamp must not wrap
-            // around into an apparently valid quote timestamp.
-            for timestamp in [(1u64 << 48) / 1000 + 1, u64::MAX] {
-                assert_eq!(
-                    restamp(overrides.clone(), stamp, stamp, timestamp),
-                    overrides
-                );
-            }
-
-            let mut expected = overrides.clone();
-            let account = expected.get_mut(&oracle).unwrap();
-            let words = if full_state {
-                account.state.as_mut().unwrap()
-            } else {
-                account.state_diff.as_mut().unwrap()
-            };
-            // Only uint48 milliseconds at bytes 25..31 change: all price
-            // bytes, the final byte, and other account fields must survive.
-            words.insert(
-                slot,
-                "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2af5800"
-                    .parse()
-                    .unwrap(),
-            );
-            let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
-            publish(&venues, block_number, &sender);
-            let handle = handle(receiver, Duration::from_secs(30));
-            assert_eq!(
-                handle.overrides_for(head.number, head.timestamp),
-                Some(expected)
-            );
-            // Restamping a copy must not change the stored snapshot.
-            assert_eq!(
-                handle.overrides_for(block_number, 1_788_781_715),
-                Some(overrides)
-            );
         }
     }
 
     #[test]
-    fn metric_restamping_preserves_other_words_and_unknown_stamps() {
-        let oracle = address!("28d9ccedf1b7ac9b3f090f4f0292837de87c1d39");
-        let other = address!("3333333333333333333333333333333333333333");
-        let quoted_at: u32 = 1_788_781_715;
-        let frame: Frame = serde_json::from_str(METRIC_FRAME).unwrap();
-        let mut overrides = frame.venues.into_values().next().unwrap().state_override;
-        let quoted_word = *overrides[&oracle]
-            .state_diff
-            .as_ref()
-            .unwrap()
-            .values()
-            .next()
-            .unwrap();
-        let mut stale = quoted_word;
-        stale[25..31].copy_from_slice(&1_788_781_703_000u64.to_be_bytes()[2..]);
-        // A price can coincidentally start with the seconds stamp. Metric's
-        // price bytes must never be interpreted as a registry freshness stamp.
-        stale[..4].copy_from_slice(&quoted_at.to_be_bytes());
-        let mut fractional = quoted_word;
+    fn seconds_stamps_take_priority_and_milliseconds_match_exactly() {
+        let fresh = millisecond_word(QUOTED_AT);
+        let mut both = fresh;
+        both[..4].copy_from_slice(&QUOTED_AT.to_be_bytes());
+        let mut fractional = fresh;
         fractional[30] += 1;
-        let mut future = quoted_word;
-        future[25..31].copy_from_slice(&1_788_781_727_000u64.to_be_bytes()[2..]);
-        overrides
-            .get_mut(&oracle)
-            .unwrap()
-            .state_diff
-            .as_mut()
-            .unwrap()
-            .extend([(lane(1), stale), (lane(2), fractional), (lane(3), future)]);
-        // The same trailing bytes in an unknown account are not a timestamp.
-        overrides.insert(
-            other,
-            AccountOverride {
-                state_diff: Some([(lane(1), quoted_word)].into_iter().collect()),
-                ..Default::default()
-            },
-        );
-        // Registry handling must preserve the trailing bytes, even if they
-        // happen to match Metric's stamp as well.
-        let mut registry_word = quoted_word;
-        registry_word[..4].copy_from_slice(&quoted_at.to_be_bytes());
-        overrides.insert(
-            REGISTRY,
-            AccountOverride {
-                state_diff: Some([(lane(1), registry_word)].into_iter().collect()),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            restamp(overrides.clone(), None, None, 1_788_781_703),
-            overrides
-        );
-        let restamped = restamp(
-            overrides.clone(),
-            Some(quoted_at),
-            Some(quoted_at),
-            1_788_781_703,
-        );
-        let metric_words = restamped[&oracle].state_diff.as_ref().unwrap();
-        assert_eq!(metric_words[&lane(1)], stale);
-        assert_eq!(metric_words[&lane(2)], fractional);
-        assert_eq!(metric_words[&lane(3)], future);
-        assert_eq!(restamped[&other], overrides[&other]);
-        registry_word[..4].copy_from_slice(&1_788_781_703u32.to_be_bytes());
-        assert_eq!(lanes_of(&restamped)[&lane(1)], registry_word);
-
-        for (account, word) in [
-            (oracle, stale),
-            (oracle, fractional),
-            (oracle, future),
-            (other, quoted_word),
-        ] {
-            let mut frame: Frame = serde_json::from_str(METRIC_FRAME).unwrap();
-            frame.venues.get_mut(&oracle).unwrap().state_override = [(
-                account,
-                AccountOverride {
-                    state_diff: Some([(lane(1), word)].into_iter().collect()),
-                    ..Default::default()
-                },
-            )]
-            .into_iter()
-            .collect();
-            let mut venues = Venues::default();
-            venues.update(frame, Some(quoted_at));
-            assert_eq!(venues.fold().1, None);
-        }
+        let words = [
+            (lane(1), both),
+            (lane(2), fresh),
+            (lane(3), fractional),
+            (lane(4), millisecond_word(QUOTED_AT - SPACING)),
+            (lane(5), millisecond_word(QUOTED_AT + SPACING)),
+        ];
+        let handle = handle_for(vec![registry_frame(Address::ZERO, &words)], QUOTED_BLOCK, Duration::from_secs(30));
+        let timestamp = QUOTED_AT - SPACING;
+        let overrides = handle.overrides_for(QUOTED_BLOCK - 1, timestamp.into()).unwrap();
+        let mut expected: B256Map<_> = words.into_iter().collect();
+        both[..4].copy_from_slice(&timestamp.to_be_bytes());
+        expected.insert(lane(1), both);
+        expected.insert(lane(2), millisecond_word(timestamp));
+        assert_eq!(lanes_of(&overrides), &expected);
     }
 
     #[test]
-    fn metric_and_registry_quotes_share_the_newest_stamp() {
-        let quoted_at: u32 = 1_788_781_715;
-        let stale = quoted_at - SPACING;
-        let mut venues = Venues::default();
-        venues.update(
-            registry_frame(
-                address!("1111111111111111111111111111111111111111"),
-                &[(lane(1), word(stale, 0xaa))],
-            ),
-            Some(stale),
-        );
-        venues.update(serde_json::from_str(METRIC_FRAME).unwrap(), Some(quoted_at));
-        let (overrides, stamp) = venues.fold();
-        assert_eq!(stamp, Some(quoted_at));
-        let restamped = restamp(
-            overrides,
-            stamp,
-            Some(quoted_at),
-            u64::from(stale - SPACING),
-        );
-        assert_eq!(lanes_of(&restamped)[&lane(1)], word(stale, 0xaa));
-
-        venues.update(
-            registry_frame(
-                address!("3333333333333333333333333333333333333333"),
-                &[(lane(2), word(quoted_at, 0xbb))],
-            ),
-            Some(quoted_at),
-        );
-        let (overrides, stamp) = venues.fold();
-        let restamped = restamp(overrides, stamp, Some(quoted_at), stale.into());
-        assert_eq!(lanes_of(&restamped)[&lane(1)], word(stale, 0xaa));
-        assert_eq!(lanes_of(&restamped)[&lane(2)], word(stale, 0xbb));
-    }
-
-    #[test]
-    fn metric_frame_cannot_borrow_a_registry_stamp() {
-        let stale = 1_788_781_715;
-        for (expected_stamp, registry_stamp) in [
-            (None, stale),
-            (Some(stale + 24), stale),
-            (Some(stale), stale + 24),
+    fn millisecond_words_require_their_own_fresh_frame() {
+        let quoted_at = QUOTED_AT;
+        let fresh = millisecond_word(quoted_at);
+        // Both venues share an account. Eligibility must belong to the word's
+        // own frame, including when another frame overwrites the same slot.
+        for (own_stamp, newest_stamp, simulated_at, overwrite) in [
+            (None, quoted_at, quoted_at - SPACING, false),
+            (Some(quoted_at - SPACING), quoted_at, quoted_at - SPACING, false),
+            (Some(quoted_at + SPACING), quoted_at + SPACING, quoted_at - SPACING, false),
+            (Some(quoted_at), quoted_at + SPACING, quoted_at - SPACING, false),
+            (Some(quoted_at), quoted_at, quoted_at + SPACING, false),
+            (Some(quoted_at), quoted_at, quoted_at - SPACING, true),
         ] {
             let mut venues = Venues::default();
-            venues.update(
-                registry_frame(
-                    address!("1111111111111111111111111111111111111111"),
-                    &[(lane(1), word(registry_stamp, 0xaa))],
-                ),
-                Some(registry_stamp),
-            );
-            let mut frame: Frame = serde_json::from_str(METRIC_FRAME).unwrap();
-            frame.block_number = Some(25_925_282);
-            venues.update(frame, expected_stamp);
-            let (original, stamp) = venues.fold();
-            assert_eq!(stamp, Some(registry_stamp));
-            assert_eq!(
-                venues.0[&METRIC_ORACLE].stamp,
-                expected_stamp.filter(|stamp| *stamp == stale)
-            );
-
+            venues.update(registry_frame(Address::ZERO, &[
+                (lane(1), fresh),
+                (lane(2), word(own_stamp.unwrap_or(0), 0xcc)),
+            ]), own_stamp);
+            let mut other_words = vec![(lane(3), word(newest_stamp, 0xbb))];
+            if overwrite {
+                other_words.push((lane(1), fresh));
+            }
+            venues.update(registry_frame(Address::repeat_byte(1), &other_words), if overwrite { None } else { Some(newest_stamp) });
             let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
-            publish(&venues, 25_925_282, &sender);
+            publish(&venues, QUOTED_BLOCK + 2, &sender);
             let handle = handle(receiver, Duration::from_secs(30));
-            let restamped = handle
-                .overrides_for(25_925_281, u64::from(stale + 12))
-                .unwrap();
-            // A fresh snapshot cannot make Metric eligible when its own
-            // frame is unrecognized or another venue has a newer stamp.
-            assert_eq!(restamped[&METRIC_ORACLE], original[&METRIC_ORACLE]);
+            let overrides = handle.overrides_for(QUOTED_BLOCK, simulated_at.into()).unwrap();
+            assert_eq!(lanes_of(&overrides)[&lane(1)], fresh, "own={own_stamp:?}, newest={newest_stamp}, simulated={simulated_at}, overwrite={overwrite}");
         }
-    }
-
-    #[test]
-    fn fresh_frames_cannot_move_an_old_metric_quote_forward() {
-        let stamp = 1_788_781_715;
-        let mut venues = Venues::default();
-        venues.update(serde_json::from_str(METRIC_FRAME).unwrap(), Some(stamp));
-        venues.update(
-            registry_frame(
-                address!("1111111111111111111111111111111111111111"),
-                &[(lane(1), word(stamp, 0xaa))],
-            ),
-            Some(stamp),
-        );
-        let mut later_frame = frame_with(
-            address!("3333333333333333333333333333333333333333"),
-            address!("4444444444444444444444444444444444444444"),
-            Some(U256::ZERO),
-            None,
-        );
-        later_frame.block_number = Some(25_925_282);
-        venues.update(later_frame, Some(stamp + 24));
-        let original = venues.fold().0;
-        let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
-        publish(&venues, 25_925_282, &sender);
-        let handle = handle(receiver, Duration::from_secs(30));
-        let restamped = handle
-            .overrides_for(25_925_281, u64::from(stamp + 12))
-            .unwrap();
-        assert_eq!(restamped[&METRIC_ORACLE], original[&METRIC_ORACLE]);
-        assert_eq!(lanes_of(&restamped)[&lane(1)], word(stamp + 12, 0xaa));
     }
 
     #[test]
@@ -1149,12 +978,12 @@ mod tests {
     fn restamping_leaves_every_other_byte_untouched() {
         let mut venues = Venues::default();
         venues.update(serde_json::from_str(FERMI_FRAME).unwrap(), Some(QUOTED_AT));
-        let (overrides, stamp) = venues.fold();
+        let (overrides, stamp, _) = venues.fold();
         assert_eq!(stamp, Some(QUOTED_AT));
 
         let simulated_at = QUOTED_AT - SPACING;
         let original = overrides.clone();
-        let restamped = restamp(overrides, stamp, None, simulated_at.into());
+        let restamped = restamp(overrides, stamp, simulated_at.into());
 
         // Only the stamp bytes of the registry words moved; the maker's price
         // bytes and every other account are byte-identical.
@@ -1309,27 +1138,6 @@ mod tests {
         }
     }"#;
 
-    // Metric fragment of a Titan snapshot for block 25,925,280. The packed
-    // quote timestamp is 1,788,781,715,000 milliseconds (0x01a07bb2de38).
-    const METRIC_FRAME: &str = r#"{
-        "blockNumber":25925280,
-        "0x28d9ccedf1b7ac9b3f090f4f0292837de87c1d39":{
-            "stateOverride":{
-                "0x28d9ccedf1b7ac9b3f090f4f0292837de87c1d39":{
-                    "balance":"0x0",
-                    "nonce":"0x1",
-                    "stateDiff":{
-                        "0xe3ffa73f3a3b56e693c2ed775464cb3fbe78307b000000000000000000000000":"0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2de3800"
-                    }
-                },
-                "0xe3ffa73f3a3b56e693c2ed775464cb3fbe78307b":{
-                    "balance":"0xd99f574e419fbde",
-                    "nonce":"0x1e563"
-                }
-            }
-        }
-    }"#;
-
     const OTHER_FRAME: &str = r#"{
         "slot":14711587,
         "blockNumber":25475333,
@@ -1359,7 +1167,7 @@ mod tests {
 
         let mut venues = Venues::default();
         venues.update(fermi, Some(QUOTED_AT));
-        let (overrides, stamp) = venues.fold();
+        let (overrides, stamp, _) = venues.fold();
         assert_eq!(stamp, Some(QUOTED_AT));
         assert_eq!(overrides.len(), 5);
 
@@ -1385,7 +1193,7 @@ mod tests {
 
         let mut venues = Venues::default();
         venues.update(serde_json::from_str(FERMI_FRAME).unwrap(), Some(projected));
-        let (overrides, stamp) = venues.fold();
+        let (overrides, stamp, _) = venues.fold();
         assert_eq!(stamp, Some(QUOTED_AT));
         let stamp = projected.to_be_bytes();
         assert!(
