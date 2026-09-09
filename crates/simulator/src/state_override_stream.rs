@@ -119,7 +119,11 @@ impl SimulationOverrides {
                 metrics.record_override_result(OverrideResult::Empty);
                 return None;
             }
-            (snapshot.overrides.clone(), snapshot.stamp, snapshot.millisecond_stamps.clone())
+            (
+                snapshot.overrides.clone(),
+                snapshot.stamp,
+                snapshot.millisecond_stamps.clone(),
+            )
         };
         metrics.record_override_result(OverrideResult::Fresh);
         let overrides = restamp(overrides, stamp, &millisecond_stamps, timestamp);
@@ -146,12 +150,15 @@ fn restamp(
     };
     // Never revive a millisecond quote after its target time. This also
     // bounds the multiplication to a uint32 timestamp, which fits uint48 ms.
-    let millis_timestamp = (timestamp <= u64::from(stamp))
-        .then(|| (timestamp * 1000).to_be_bytes());
+    let millis_timestamp =
+        (timestamp <= u64::from(stamp)).then(|| (timestamp * 1000).to_be_bytes());
     let stamp_bytes = stamp.to_be_bytes();
     let timestamp_bytes = (timestamp as u32).to_be_bytes();
     for (address, account) in &mut overrides {
-        for (is_state_diff, words) in [(false, account.state.as_mut()), (true, account.state_diff.as_mut())] {
+        for (is_state_diff, words) in [
+            (false, account.state.as_mut()),
+            (true, account.state_diff.as_mut()),
+        ] {
             for (slot, word) in words.into_iter().flatten() {
                 if word[..STAMP_LEN] == stamp_bytes {
                     word[..STAMP_LEN].copy_from_slice(&timestamp_bytes);
@@ -401,7 +408,8 @@ impl Venues {
             let overrides = update.state_override;
             let stamp = quoted_at.filter(|stamp| {
                 words(&overrides).any(|word| {
-                    word[..STAMP_LEN] == stamp.to_be_bytes() || matches_millisecond_stamp(word, *stamp)
+                    word[..STAMP_LEN] == stamp.to_be_bytes()
+                        || matches_millisecond_stamp(word, *stamp)
                 })
             });
             self.0.insert(venue, Quotes { overrides, stamp });
@@ -421,7 +429,10 @@ impl Venues {
         for quotes in self.0.values() {
             stamp = stamp.max(quotes.stamp);
             for (account, account_override) in &quotes.overrides {
-                for (is_state_diff, words) in [(false, account_override.state.as_ref()), (true, account_override.state_diff.as_ref())] {
+                for (is_state_diff, words) in [
+                    (false, account_override.state.as_ref()),
+                    (true, account_override.state_diff.as_ref()),
+                ] {
                     for (slot, word) in words.into_iter().flatten() {
                         let key = (*account, *slot, is_state_diff);
                         millisecond_stamps.remove(&key);
@@ -857,33 +868,65 @@ mod tests {
     #[test]
     fn millisecond_words_restamp_at_any_address() {
         // Captured Titan quote for block 25,925,280 and its parent timestamp.
-        let original: B256 = "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2de3800".parse().unwrap();
-        let expected: B256 = "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2af5800".parse().unwrap();
+        let original: B256 = "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2de3800"
+            .parse()
+            .unwrap();
+        let expected: B256 = "0x5f3f82df171805f5e2f401018738ad0713148735fecc13140001a07bb2af5800"
+            .parse()
+            .unwrap();
         for address in [
             address!("28d9ccedf1b7ac9b3f090f4f0292837de87c1d39"),
             address!("1111111111111111111111111111111111111111"),
         ] {
             for full_state in [false, true] {
-                let mut frame = frame_with(Address::ZERO, address, Some(U256::from(7)), Some(lane(1)));
-                let account = frame.venues.get_mut(&Address::ZERO).unwrap().state_override.get_mut(&address).unwrap();
-                account.state_diff.as_mut().unwrap().insert(lane(1), original);
+                let mut frame =
+                    frame_with(Address::ZERO, address, Some(U256::from(7)), Some(lane(1)));
+                let account = frame
+                    .venues
+                    .get_mut(&Address::ZERO)
+                    .unwrap()
+                    .state_override
+                    .get_mut(&address)
+                    .unwrap();
+                account
+                    .state_diff
+                    .as_mut()
+                    .unwrap()
+                    .insert(lane(1), original);
                 if full_state {
                     account.state = account.state_diff.take();
                 }
                 let unmodified = frame.venues[&Address::ZERO].state_override.clone();
                 let mut expected_overrides = unmodified.clone();
                 let account = expected_overrides.get_mut(&address).unwrap();
-                account.state.as_mut().or(account.state_diff.as_mut()).unwrap().insert(lane(1), expected);
+                account
+                    .state
+                    .as_mut()
+                    .or(account.state_diff.as_mut())
+                    .unwrap()
+                    .insert(lane(1), expected);
                 let mut venues = Venues::default();
                 venues.update(frame, Some(1_788_781_715));
                 let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
                 publish(&venues, 25_925_280, &sender);
                 let handle = handle(receiver, Duration::from_secs(30));
-                assert_eq!(handle.overrides_for(25_925_279, 1_788_781_703), Some(expected_overrides));
+                assert_eq!(
+                    handle.overrides_for(25_925_279, 1_788_781_703),
+                    Some(expected_overrides)
+                );
                 // Copies are restamped; the snapshot must survive, and an old
-                // quote must never be moved forward (including overflow inputs).
-                for timestamp in [1_788_781_715, 1_788_781_727, (1u64 << 48) / 1000 + 1, u64::MAX] {
-                    assert_eq!(handle.overrides_for(25_925_279, timestamp), Some(unmodified.clone()));
+                // quote must never be moved forward (including overflow
+                // inputs).
+                for timestamp in [
+                    1_788_781_715,
+                    1_788_781_727,
+                    (1u64 << 48) / 1000 + 1,
+                    u64::MAX,
+                ] {
+                    assert_eq!(
+                        handle.overrides_for(25_925_279, timestamp),
+                        Some(unmodified.clone())
+                    );
                 }
             }
         }
@@ -903,9 +946,15 @@ mod tests {
             (lane(4), millisecond_word(QUOTED_AT - SPACING)),
             (lane(5), millisecond_word(QUOTED_AT + SPACING)),
         ];
-        let handle = handle_for(vec![registry_frame(Address::ZERO, &words)], QUOTED_BLOCK, Duration::from_secs(30));
+        let handle = handle_for(
+            vec![registry_frame(Address::ZERO, &words)],
+            QUOTED_BLOCK,
+            Duration::from_secs(30),
+        );
         let timestamp = QUOTED_AT - SPACING;
-        let overrides = handle.overrides_for(QUOTED_BLOCK - 1, timestamp.into()).unwrap();
+        let overrides = handle
+            .overrides_for(QUOTED_BLOCK - 1, timestamp.into())
+            .unwrap();
         let mut expected: B256Map<_> = words.into_iter().collect();
         both[..4].copy_from_slice(&timestamp.to_be_bytes());
         expected.insert(lane(1), both);
@@ -916,32 +965,50 @@ mod tests {
     #[test]
     fn millisecond_words_require_their_own_fresh_frame() {
         let quoted_at = QUOTED_AT;
+        let previous = quoted_at - SPACING;
+        let next = quoted_at + SPACING;
         let fresh = millisecond_word(quoted_at);
         // Both venues share an account. Eligibility must belong to the word's
         // own frame, including when another frame overwrites the same slot.
         for (own_stamp, newest_stamp, simulated_at, overwrite) in [
-            (None, quoted_at, quoted_at - SPACING, false),
-            (Some(quoted_at - SPACING), quoted_at, quoted_at - SPACING, false),
-            (Some(quoted_at + SPACING), quoted_at + SPACING, quoted_at - SPACING, false),
-            (Some(quoted_at), quoted_at + SPACING, quoted_at - SPACING, false),
-            (Some(quoted_at), quoted_at, quoted_at + SPACING, false),
-            (Some(quoted_at), quoted_at, quoted_at - SPACING, true),
+            (None, quoted_at, previous, false),
+            (Some(previous), quoted_at, previous, false),
+            (Some(next), next, previous, false),
+            (Some(quoted_at), next, previous, false),
+            (Some(quoted_at), quoted_at, next, false),
+            (Some(quoted_at), quoted_at, previous, true),
         ] {
             let mut venues = Venues::default();
-            venues.update(registry_frame(Address::ZERO, &[
-                (lane(1), fresh),
-                (lane(2), word(own_stamp.unwrap_or(0), 0xcc)),
-            ]), own_stamp);
+            venues.update(
+                registry_frame(
+                    Address::ZERO,
+                    &[
+                        (lane(1), fresh),
+                        (lane(2), word(own_stamp.unwrap_or(0), 0xcc)),
+                    ],
+                ),
+                own_stamp,
+            );
             let mut other_words = vec![(lane(3), word(newest_stamp, 0xbb))];
             if overwrite {
                 other_words.push((lane(1), fresh));
             }
-            venues.update(registry_frame(Address::repeat_byte(1), &other_words), if overwrite { None } else { Some(newest_stamp) });
+            venues.update(
+                registry_frame(Address::repeat_byte(1), &other_words),
+                if overwrite { None } else { Some(newest_stamp) },
+            );
             let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
             publish(&venues, QUOTED_BLOCK + 2, &sender);
             let handle = handle(receiver, Duration::from_secs(30));
-            let overrides = handle.overrides_for(QUOTED_BLOCK, simulated_at.into()).unwrap();
-            assert_eq!(lanes_of(&overrides)[&lane(1)], fresh, "own={own_stamp:?}, newest={newest_stamp}, simulated={simulated_at}, overwrite={overwrite}");
+            let overrides = handle
+                .overrides_for(QUOTED_BLOCK, simulated_at.into())
+                .unwrap();
+            assert_eq!(
+                lanes_of(&overrides)[&lane(1)],
+                fresh,
+                "own={own_stamp:?}, newest={newest_stamp}, simulated={simulated_at}, \
+                 overwrite={overwrite}"
+            );
         }
     }
 
@@ -978,12 +1045,12 @@ mod tests {
     fn restamping_leaves_every_other_byte_untouched() {
         let mut venues = Venues::default();
         venues.update(serde_json::from_str(FERMI_FRAME).unwrap(), Some(QUOTED_AT));
-        let (overrides, stamp, _) = venues.fold();
+        let (overrides, stamp, millisecond_stamps) = venues.fold();
         assert_eq!(stamp, Some(QUOTED_AT));
 
         let simulated_at = QUOTED_AT - SPACING;
         let original = overrides.clone();
-        let restamped = restamp(overrides, stamp, simulated_at.into());
+        let restamped = restamp(overrides, stamp, &millisecond_stamps, simulated_at.into());
 
         // Only the stamp bytes of the registry words moved; the maker's price
         // bytes and every other account are byte-identical.
