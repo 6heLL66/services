@@ -43,7 +43,11 @@ use {
 const STAMP_LEN: usize = 4;
 const MILLIS_STAMP_RANGE: std::ops::Range<usize> = 25..31;
 
-type MillisecondStamps = BTreeMap<(Address, B256, bool), u32>;
+#[derive(Clone, Default)]
+struct MillisecondStamps {
+    stamp: Option<u32>,
+    words: BTreeMap<(Address, B256, bool), u32>,
+}
 
 /// How many recent block gaps are kept to infer the chain's block spacing. A
 /// handful is enough to see past a slot nobody proposed, and few enough that a
@@ -139,12 +143,11 @@ fn restamp(
     millisecond_stamps: &MillisecondStamps,
     timestamp: u64,
 ) -> StateOverride {
-    let Some(stamp) = stamp else {
-        return overrides;
-    };
-    if timestamp <= u64::from(stamp) {
-        for ((address, slot, is_state_diff), quoted_at) in millisecond_stamps {
-            if *quoted_at != stamp {
+    if let Some(millisecond_stamp) = millisecond_stamps.stamp
+        && timestamp <= u64::from(millisecond_stamp)
+    {
+        for ((address, slot, is_state_diff), quoted_at) in &millisecond_stamps.words {
+            if *quoted_at != millisecond_stamp {
                 continue;
             }
             let Some(account) = overrides.get_mut(address) else {
@@ -156,12 +159,15 @@ fn restamp(
                 account.state.as_mut()
             };
             if let Some(word) = words.and_then(|words| words.get_mut(slot))
-                && word[..STAMP_LEN] != stamp.to_be_bytes()
+                && !stamp.is_some_and(|stamp| word[..STAMP_LEN] == stamp.to_be_bytes())
             {
                 word[MILLIS_STAMP_RANGE].copy_from_slice(&(timestamp * 1000).to_be_bytes()[2..]);
             }
         }
     }
+    let Some(stamp) = stamp else {
+        return overrides;
+    };
     let stamp = stamp.to_be_bytes();
     let timestamp = (timestamp as u32).to_be_bytes();
     for account in overrides.values_mut() {
@@ -176,7 +182,8 @@ fn restamp(
 }
 
 fn matches_millisecond_stamp(word: &B256, stamp: u32) -> bool {
-    word[MILLIS_STAMP_RANGE] == (u64::from(stamp) * 1000).to_be_bytes()[2..]
+    word[..STAMP_LEN] != stamp.to_be_bytes()
+        && word[MILLIS_STAMP_RANGE] == (u64::from(stamp) * 1000).to_be_bytes()[2..]
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +308,7 @@ pub fn spawn_pamm_stream(cfg: &Config, blocks: CurrentBlockWatcher) -> Simulatio
         overrides: StateOverride::default(),
         block_number: 0,
         stamp: None,
-        millisecond_stamps: MillisecondStamps::new(),
+        millisecond_stamps: MillisecondStamps::default(),
         received_at: None,
     });
 
@@ -389,6 +396,7 @@ struct Quotes {
     /// Block timestamp this venue's freshly quoted lanes are stamped with,
     /// when its newest frame quoted any.
     stamp: Option<u32>,
+    millisecond_stamp: Option<u32>,
 }
 
 /// The newest frame of every venue seen so far.
@@ -408,12 +416,20 @@ impl Venues {
         for (venue, update) in frame.venues {
             let overrides = update.state_override;
             let stamp = quoted_at.filter(|stamp| {
-                words(&overrides).any(|word| {
-                    word[..STAMP_LEN] == stamp.to_be_bytes()
-                        || matches_millisecond_stamp(word, *stamp)
-                })
+                let stamp = stamp.to_be_bytes();
+                words(&overrides).any(|word| word[..STAMP_LEN] == stamp)
             });
-            self.0.insert(venue, Quotes { overrides, stamp });
+            let millisecond_stamp = quoted_at.filter(|stamp| {
+                words(&overrides).any(|word| matches_millisecond_stamp(word, *stamp))
+            });
+            self.0.insert(
+                venue,
+                Quotes {
+                    overrides,
+                    stamp,
+                    millisecond_stamp,
+                },
+            );
         }
     }
 
@@ -426,9 +442,10 @@ impl Venues {
     fn fold(&self) -> (StateOverride, Option<u32>, MillisecondStamps) {
         let mut overrides = StateOverride::default();
         let mut stamp = None;
-        let mut millisecond_stamps = MillisecondStamps::new();
+        let mut millisecond_stamps = MillisecondStamps::default();
         for quotes in self.0.values() {
             stamp = stamp.max(quotes.stamp);
+            millisecond_stamps.stamp = millisecond_stamps.stamp.max(quotes.millisecond_stamp);
             for (account, account_override) in &quotes.overrides {
                 for (is_state_diff, words) in [
                     (false, account_override.state.as_ref()),
@@ -436,11 +453,11 @@ impl Venues {
                 ] {
                     for (slot, word) in words.into_iter().flatten() {
                         let key = (*account, *slot, is_state_diff);
-                        millisecond_stamps.remove(&key);
-                        if let Some(stamp) = quotes.stamp
+                        millisecond_stamps.words.remove(&key);
+                        if let Some(stamp) = quotes.millisecond_stamp
                             && matches_millisecond_stamp(word, stamp)
                         {
-                            millisecond_stamps.insert(key, stamp);
+                            millisecond_stamps.words.insert(key, stamp);
                         }
                     }
                 }
@@ -782,7 +799,7 @@ mod tests {
             overrides,
             block_number,
             stamp: None,
-            millisecond_stamps: MillisecondStamps::new(),
+            millisecond_stamps: MillisecondStamps::default(),
             received_at: Some(received_at),
         }
     }
@@ -817,7 +834,7 @@ mod tests {
             overrides: StateOverride::default(),
             block_number: 100,
             stamp: None,
-            millisecond_stamps: MillisecondStamps::new(),
+            millisecond_stamps: MillisecondStamps::default(),
             received_at: Some(Instant::now()),
         });
         assert!(
@@ -990,7 +1007,7 @@ mod tests {
                 ),
                 own_stamp,
             );
-            let mut other_words = vec![(lane(3), word(newest_stamp, 0xbb))];
+            let mut other_words = vec![(lane(3), millisecond_word(newest_stamp))];
             if overwrite {
                 other_words.push((lane(1), fresh));
             }
@@ -1010,6 +1027,62 @@ mod tests {
                 "own={own_stamp:?}, newest={newest_stamp}, simulated={simulated_at}, \
                  overwrite={overwrite}"
             );
+        }
+    }
+
+    #[test]
+    fn millisecond_and_seconds_use_independent_stamps() {
+        for (seconds_stamp, millisecond_stamp) in [
+            (QUOTED_AT, QUOTED_AT + SPACING),
+            (QUOTED_AT + SPACING, QUOTED_AT),
+        ] {
+            for full_state in [false, true] {
+                let mut venues = Venues::default();
+                for (venue, slot, value, projected) in [
+                    (
+                        Address::ZERO,
+                        lane(1),
+                        word(seconds_stamp, 0xaa),
+                        seconds_stamp,
+                    ),
+                    (
+                        Address::repeat_byte(1),
+                        lane(2),
+                        millisecond_word(millisecond_stamp),
+                        millisecond_stamp,
+                    ),
+                ] {
+                    let mut frame = registry_frame(venue, &[(slot, value)]);
+                    if full_state {
+                        let account = frame
+                            .venues
+                            .get_mut(&venue)
+                            .unwrap()
+                            .state_override
+                            .get_mut(&REGISTRY)
+                            .unwrap();
+                        account.state = account.state_diff.take();
+                    }
+                    venues.update(frame, Some(projected));
+                }
+                assert_eq!(venues.fold().1, Some(seconds_stamp));
+                let (sender, receiver) = watch::channel(non_empty_snapshot(0, Instant::now()));
+                publish(&venues, QUOTED_BLOCK + 1, &sender);
+                let handle = handle(receiver, Duration::from_secs(30));
+                let timestamp = QUOTED_AT - SPACING;
+                let overrides = handle
+                    .overrides_for(QUOTED_BLOCK - 1, timestamp.into())
+                    .unwrap();
+                let account = &overrides[&REGISTRY];
+                let words = if full_state {
+                    account.state.as_ref()
+                } else {
+                    account.state_diff.as_ref()
+                }
+                .unwrap();
+                assert_eq!(words[&lane(1)], word(timestamp, 0xaa));
+                assert_eq!(words[&lane(2)], millisecond_word(timestamp));
+            }
         }
     }
 
