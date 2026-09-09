@@ -16,9 +16,6 @@
 //!   unless it equals the timestamp of the block the call runs in; the
 //!   remaining 28 bytes are the maker's price.
 //!
-//! A second layout stores uint48 milliseconds at bytes 25..31. Leading
-//! seconds take precedence when both layouts match the projected stamp.
-//!
 //! Which words are stamps is never guessed from their contents: the block a
 //! frame quotes for is named in the frame, and the timestamp that block will
 //! carry is projected from the chain itself, so the value to look for is known
@@ -44,11 +41,8 @@ use {
 /// stamp. The remaining bytes are the maker's price and must survive
 /// restamping untouched.
 const STAMP_LEN: usize = 4;
-/// Big-endian uint48 milliseconds; the final byte is not part of the stamp.
 const MILLIS_STAMP_RANGE: std::ops::Range<usize> = 25..31;
 
-/// Frame timestamps keyed by account, storage slot and whether it is stateDiff.
-/// Keep provenance per word: venues can share an account and overwrite slots.
 type MillisecondStamps = BTreeMap<(Address, B256, bool), u32>;
 
 /// How many recent block gaps are kept to infer the chain's block spacing. A
@@ -148,26 +142,33 @@ fn restamp(
     let Some(stamp) = stamp else {
         return overrides;
     };
-    // Never revive a millisecond quote after its target time. This also
-    // bounds the multiplication to a uint32 timestamp, which fits uint48 ms.
-    let millis_timestamp =
-        (timestamp <= u64::from(stamp)).then(|| (timestamp * 1000).to_be_bytes());
-    let stamp_bytes = stamp.to_be_bytes();
-    let timestamp_bytes = (timestamp as u32).to_be_bytes();
-    for (address, account) in &mut overrides {
-        for (is_state_diff, words) in [
-            (false, account.state.as_mut()),
-            (true, account.state_diff.as_mut()),
-        ] {
-            for (slot, word) in words.into_iter().flatten() {
-                if word[..STAMP_LEN] == stamp_bytes {
-                    word[..STAMP_LEN].copy_from_slice(&timestamp_bytes);
-                } else if let Some(timestamp) = millis_timestamp
-                    && millisecond_stamps.get(&(*address, *slot, is_state_diff)) == Some(&stamp)
-                    && matches_millisecond_stamp(word, stamp)
-                {
-                    word[MILLIS_STAMP_RANGE].copy_from_slice(&timestamp[2..]);
-                }
+    if timestamp <= u64::from(stamp) {
+        for ((address, slot, is_state_diff), quoted_at) in millisecond_stamps {
+            if *quoted_at != stamp {
+                continue;
+            }
+            let Some(account) = overrides.get_mut(address) else {
+                continue;
+            };
+            let words = if *is_state_diff {
+                account.state_diff.as_mut()
+            } else {
+                account.state.as_mut()
+            };
+            if let Some(word) = words.and_then(|words| words.get_mut(slot))
+                && word[..STAMP_LEN] != stamp.to_be_bytes()
+            {
+                word[MILLIS_STAMP_RANGE].copy_from_slice(&(timestamp * 1000).to_be_bytes()[2..]);
+            }
+        }
+    }
+    let stamp = stamp.to_be_bytes();
+    let timestamp = (timestamp as u32).to_be_bytes();
+    for account in overrides.values_mut() {
+        let words = [account.state.as_mut(), account.state_diff.as_mut()];
+        for word in words.into_iter().flatten().flat_map(B256Map::values_mut) {
+            if word[..STAMP_LEN] == stamp {
+                word[..STAMP_LEN].copy_from_slice(&timestamp);
             }
         }
     }
@@ -419,7 +420,7 @@ impl Venues {
     /// Folds every venue's newest frame into one override set, along with the
     /// newest stamp any of them quoted.
     ///
-    /// Venues can keep their lanes in the same shared registry account and a
+    /// Every venue keeps its lanes in the same shared registry account and a
     /// frame only ever carries its own, so storage is merged word by word:
     /// inserting the account wholesale would drop the other venues' lanes.
     fn fold(&self) -> (StateOverride, Option<u32>, MillisecondStamps) {
