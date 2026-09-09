@@ -1,0 +1,27 @@
+name: Metric timestamp validation
+
+on:
+  push:
+    branches: [ci/metric-oracle-restamping]
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --locked -p simulator
+      - run: cargo clippy --locked -p simulator --all-features --all-targets -- -D warnings
