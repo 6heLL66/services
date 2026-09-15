@@ -43,12 +43,6 @@ use {
 const STAMP_LEN: usize = 4;
 const MILLIS_STAMP_RANGE: std::ops::Range<usize> = 25..31;
 
-#[derive(Clone, Default)]
-struct MillisecondStamps {
-    stamp: Option<u32>,
-    words: BTreeMap<(Address, B256, bool), u32>,
-}
-
 /// How many recent block gaps are kept to infer the chain's block spacing. A
 /// handful is enough to see past a slot nobody proposed, and few enough that a
 /// chain which respaces its blocks is followed within a few of them.
@@ -64,7 +58,7 @@ struct Snapshot {
     /// Newest stamp any venue quoted for. Only words carrying it belong to a
     /// lane a maker is quoting for `block_number`.
     stamp: Option<u32>,
-    millisecond_stamps: MillisecondStamps,
+    millisecond_stamp: Option<u32>,
     received_at: Option<Instant>,
 }
 
@@ -99,7 +93,7 @@ impl SimulationOverrides {
         let metrics = Metrics::get();
         // Holding this borrow blocks the stream task from publishing, so it is
         // released before the copy is restamped.
-        let (overrides, stamp, millisecond_stamps) = {
+        let (overrides, stamp, millisecond_stamp) = {
             let snapshot = self.0.snapshots.borrow();
             let Some(received_at) = snapshot.received_at else {
                 metrics.record_override_result(OverrideResult::Empty);
@@ -120,11 +114,11 @@ impl SimulationOverrides {
             (
                 snapshot.overrides.clone(),
                 snapshot.stamp,
-                snapshot.millisecond_stamps.clone(),
+                snapshot.millisecond_stamp,
             )
         };
         metrics.record_override_result(OverrideResult::Fresh);
-        let overrides = restamp(overrides, stamp, &millisecond_stamps, timestamp);
+        let overrides = restamp(overrides, stamp, millisecond_stamp, timestamp);
         Some(overrides)
     }
 }
@@ -140,28 +134,21 @@ impl SimulationOverrides {
 fn restamp(
     mut overrides: StateOverride,
     stamp: Option<u32>,
-    millisecond_stamps: &MillisecondStamps,
+    millisecond_stamp: Option<u32>,
     timestamp: u64,
 ) -> StateOverride {
-    if let Some(millisecond_stamp) = millisecond_stamps.stamp
+    if let Some(millisecond_stamp) = millisecond_stamp
         && timestamp <= u64::from(millisecond_stamp)
     {
-        for ((address, slot, is_state_diff), quoted_at) in &millisecond_stamps.words {
-            if *quoted_at != millisecond_stamp {
-                continue;
-            }
-            let Some(account) = overrides.get_mut(address) else {
-                continue;
-            };
-            let words = if *is_state_diff {
-                account.state_diff.as_mut()
-            } else {
-                account.state.as_mut()
-            };
-            if let Some(word) = words.and_then(|words| words.get_mut(slot))
-                && !stamp.is_some_and(|stamp| word[..STAMP_LEN] == stamp.to_be_bytes())
-            {
-                word[MILLIS_STAMP_RANGE].copy_from_slice(&(timestamp * 1000).to_be_bytes()[2..]);
+        for account in overrides.values_mut() {
+            let words = [account.state.as_mut(), account.state_diff.as_mut()];
+            for word in words.into_iter().flatten().flat_map(B256Map::values_mut) {
+                if matches_millisecond_stamp(word, millisecond_stamp)
+                    && !stamp.is_some_and(|stamp| word[..STAMP_LEN] == stamp.to_be_bytes())
+                {
+                    word[MILLIS_STAMP_RANGE]
+                        .copy_from_slice(&(timestamp * 1000).to_be_bytes()[2..]);
+                }
             }
         }
     }
@@ -308,7 +295,7 @@ pub fn spawn_pamm_stream(cfg: &Config, blocks: CurrentBlockWatcher) -> Simulatio
         overrides: StateOverride::default(),
         block_number: 0,
         stamp: None,
-        millisecond_stamps: MillisecondStamps::default(),
+        millisecond_stamp: None,
         received_at: None,
     });
 
@@ -439,35 +426,21 @@ impl Venues {
     /// Every venue keeps its lanes in the same shared registry account and a
     /// frame only ever carries its own, so storage is merged word by word:
     /// inserting the account wholesale would drop the other venues' lanes.
-    fn fold(&self) -> (StateOverride, Option<u32>, MillisecondStamps) {
+    fn fold(&self) -> (StateOverride, Option<u32>, Option<u32>) {
         let mut overrides = StateOverride::default();
         let mut stamp = None;
-        let mut millisecond_stamps = MillisecondStamps::default();
+        let mut millisecond_stamp = None;
         for quotes in self.0.values() {
             stamp = stamp.max(quotes.stamp);
-            millisecond_stamps.stamp = millisecond_stamps.stamp.max(quotes.millisecond_stamp);
+            millisecond_stamp = millisecond_stamp.max(quotes.millisecond_stamp);
             for (account, account_override) in &quotes.overrides {
-                for (is_state_diff, words) in [
-                    (false, account_override.state.as_ref()),
-                    (true, account_override.state_diff.as_ref()),
-                ] {
-                    for (slot, word) in words.into_iter().flatten() {
-                        let key = (*account, *slot, is_state_diff);
-                        millisecond_stamps.words.remove(&key);
-                        if let Some(stamp) = quotes.millisecond_stamp
-                            && matches_millisecond_stamp(word, stamp)
-                        {
-                            millisecond_stamps.words.insert(key, stamp);
-                        }
-                    }
-                }
                 merge_account(
                     overrides.entry(*account).or_default(),
                     account_override.clone(),
                 );
             }
         }
-        (overrides, stamp, millisecond_stamps)
+        (overrides, stamp, millisecond_stamp)
     }
 }
 
@@ -508,13 +481,13 @@ fn merge_words(target: &mut Option<B256Map<B256>>, update: Option<B256Map<B256>>
 }
 
 fn publish(venues: &Venues, block_number: u64, sender: &watch::Sender<Snapshot>) {
-    let (overrides, stamp, millisecond_stamps) = venues.fold();
+    let (overrides, stamp, millisecond_stamp) = venues.fold();
     Metrics::get().venue_count.set(overrides.len() as i64);
     let snapshot = Snapshot {
         overrides,
         block_number,
         stamp,
-        millisecond_stamps,
+        millisecond_stamp,
         received_at: Some(Instant::now()),
     };
     if let Err(err) = sender.send(snapshot) {
@@ -778,12 +751,12 @@ mod tests {
         for frame in frames {
             venues.update(frame, Some(QUOTED_AT));
         }
-        let (overrides, stamp, millisecond_stamps) = venues.fold();
+        let (overrides, stamp, millisecond_stamp) = venues.fold();
         let (_sender, receiver) = watch::channel(Snapshot {
             overrides,
             block_number,
             stamp,
-            millisecond_stamps,
+            millisecond_stamp,
             received_at: Some(Instant::now()),
         });
         handle(receiver, max_age)
@@ -799,7 +772,7 @@ mod tests {
             overrides,
             block_number,
             stamp: None,
-            millisecond_stamps: MillisecondStamps::default(),
+            millisecond_stamp: None,
             received_at: Some(received_at),
         }
     }
@@ -834,7 +807,7 @@ mod tests {
             overrides: StateOverride::default(),
             block_number: 100,
             stamp: None,
-            millisecond_stamps: MillisecondStamps::default(),
+            millisecond_stamp: None,
             received_at: Some(Instant::now()),
         });
         assert!(
@@ -935,12 +908,12 @@ mod tests {
     fn restamping_leaves_every_other_byte_untouched() {
         let mut venues = Venues::default();
         venues.update(serde_json::from_str(FERMI_FRAME).unwrap(), Some(QUOTED_AT));
-        let (overrides, stamp, millisecond_stamps) = venues.fold();
+        let (overrides, stamp, millisecond_stamp) = venues.fold();
         assert_eq!(stamp, Some(QUOTED_AT));
 
         let simulated_at = QUOTED_AT - SPACING;
         let original = overrides.clone();
-        let restamped = restamp(overrides, stamp, &millisecond_stamps, simulated_at.into());
+        let restamped = restamp(overrides, stamp, millisecond_stamp, simulated_at.into());
 
         // Only the stamp bytes of the registry words moved; the maker's price
         // bytes and every other account are byte-identical.
